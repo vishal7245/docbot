@@ -10,7 +10,7 @@ try:
 except FileNotFoundError:
     config = {
         'token': 'YOUR_BOT_TOKEN_HERE',
-        'guilds': {}  # Will store per-guild settings
+        'guilds': {}  # { guild_id: { "text_channel_id": id, "voice_channels": [ids] } }
     }
 
 intents = discord.Intents.default()
@@ -26,26 +26,6 @@ guild_warnings = {}
 @bot.event
 async def on_ready():
     print(f'{bot.user} has connected to Discord!')
-    # Connect to voice channels in all configured guilds
-    for guild_id, settings in config['guilds'].items():
-        if 'voice_channel_id' in settings:
-            await connect_to_channel(int(guild_id))
-
-async def connect_to_channel(guild_id: int):
-    """Connect the bot to the configured voice channel in a specific guild."""
-    guild_id_str = str(guild_id)
-    if guild_id_str not in config['guilds']:
-        return
-    
-    voice_channel_id = config['guilds'][guild_id_str].get('voice_channel_id')
-    voice_channel = bot.get_channel(voice_channel_id)
-    
-    if voice_channel:
-        try:
-            await voice_channel.connect()
-            print(f'Connected to voice channel: {voice_channel.name} (Guild: {voice_channel.guild.name})')
-        except Exception as e:
-            print(f'Error connecting to voice channel in guild {guild_id}: {e}')
 
 @bot.event
 async def on_voice_state_update(member, before, after):
@@ -60,48 +40,49 @@ async def on_voice_state_update(member, before, after):
     if guild_id_str not in guild_warnings:
         guild_warnings[guild_id_str] = {}
 
-    voice_channel_id = config['guilds'][guild_id_str].get('voice_channel_id')
-    text_channel_id = config['guilds'][guild_id_str].get('text_channel_id')
+    guild_config = config['guilds'][guild_id_str]
+    voice_channels = guild_config.get('voice_channels', [])
+    text_channel_id = guild_config.get('text_channel_id')
 
-    # May be None if not set yet, so guard against that
-    if not voice_channel_id or not text_channel_id:
+    # Skip if no channels configured
+    if not voice_channels or not text_channel_id:
         return
 
-    voice_channel = bot.get_channel(voice_channel_id)
     text_channel = bot.get_channel(text_channel_id)
 
+    # Check if the channel is one we're monitoring
+    is_monitored_channel = lambda channel: channel and channel.id in voice_channels
+
     # --- Join designated voice channel ---
-    if after.channel == voice_channel:
-        # Mute if not already muted
+    if is_monitored_channel(after.channel):
         if member.voice and not after.mute:
             try:
                 await member.edit(mute=True)
             except discord.errors.HTTPException:
                 print(f"Failed to mute {member.name} in {member.guild.name}")
         
-        # Camera is off => send warning
         if not after.self_video:
             await send_warning(member, text_channel, guild_id_str)
 
     # --- Leave designated voice channel ---
-    elif before.channel == voice_channel and after.channel != voice_channel:
+    elif is_monitored_channel(before.channel) and not is_monitored_channel(after.channel):
         await cancel_warning(member, guild_id_str)
 
     # --- Turn camera on in designated channel ---
-    if (before.channel == voice_channel
+    if (is_monitored_channel(before.channel)
         and not before.self_video
         and after.self_video
     ):
         if member.id in guild_warnings[guild_id_str]:
             await cancel_warning(member, guild_id_str)
-            if member.voice:  # Still connected
+            if member.voice:
                 try:
                     await member.edit(mute=False)
                 except discord.errors.HTTPException:
                     print(f"Failed to unmute {member.name} in {member.guild.name}")
 
     # --- Turn camera off in designated channel ---
-    if (before.channel == voice_channel
+    if (is_monitored_channel(before.channel)
         and before.self_video
         and not after.self_video
     ):
@@ -153,14 +134,15 @@ async def kick_after_delay(member, warning_msg, guild_id_str):
         # If user is still in the warnings dict, they haven't turned on camera
         if (guild_id_str in guild_warnings 
             and member.id in guild_warnings[guild_id_str]):
-            voice_channel_id = config['guilds'][guild_id_str].get('voice_channel_id')
-            voice_channel = bot.get_channel(voice_channel_id)
+            voice_channels = config['guilds'][guild_id_str].get('voice_channels', [])
             
-            if member.voice and member.voice.channel == voice_channel:
-                try:
-                    await member.move_to(None)  # Kick from channel
-                except discord.errors.HTTPException:
-                    print(f"Failed to kick {member.name} in {member.guild.name}")
+            for channel_id in voice_channels:
+                channel = bot.get_channel(channel_id)
+                if member.voice and member.voice.channel == channel:
+                    try:
+                        await member.move_to(None)  # Kick from channel
+                    except discord.errors.HTTPException:
+                        print(f"Failed to kick {member.name} in {member.guild.name}")
 
             # Remove warning message
             try:
@@ -180,21 +162,73 @@ async def kick_after_delay(member, warning_msg, guild_id_str):
 
 @bot.command()
 @commands.has_permissions(administrator=True)
-async def setvoicechannel(ctx, channel: discord.VoiceChannel):
-    """Set the designated voice channel for this server."""
+async def addvoicechannel(ctx, channel: discord.VoiceChannel):
+    """Add a voice channel to monitor in this server."""
     guild_id_str = str(ctx.guild.id)
 
     if guild_id_str not in config['guilds']:
-        config['guilds'][guild_id_str] = {}
+        config['guilds'][guild_id_str] = {'voice_channels': []}
+    
+    if 'voice_channels' not in config['guilds'][guild_id_str]:
+        config['guilds'][guild_id_str]['voice_channels'] = []
 
-    config['guilds'][guild_id_str]['voice_channel_id'] = channel.id
+    voice_channels = config['guilds'][guild_id_str]['voice_channels']
+    
+    if channel.id in voice_channels:
+        await ctx.send(f"{channel.mention} is already being monitored!")
+        return
+
+    voice_channels.append(channel.id)
     save_config()
-    await ctx.send(f"Voice channel set to {channel.mention}")
+    await ctx.send(f"Added {channel.mention} to monitored voice channels!")
 
-    # Reconnect to new voice channel
-    if ctx.guild.voice_client:
-        await ctx.guild.voice_client.disconnect()
-    await connect_to_channel(ctx.guild.id)
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def removevoicechannel(ctx, channel: discord.VoiceChannel):
+    """Remove a voice channel from monitoring in this server."""
+    guild_id_str = str(ctx.guild.id)
+    
+    if (guild_id_str not in config['guilds'] or 
+        'voice_channels' not in config['guilds'][guild_id_str] or
+        channel.id not in config['guilds'][guild_id_str]['voice_channels']):
+        await ctx.send(f"{channel.mention} is not being monitored!")
+        return
+
+    config['guilds'][guild_id_str]['voice_channels'].remove(channel.id)
+    save_config()
+    await ctx.send(f"Removed {channel.mention} from monitored voice channels!")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def listchannels(ctx):
+    """List all monitored channels in this server."""
+    guild_id_str = str(ctx.guild.id)
+    
+    if guild_id_str not in config['guilds']:
+        await ctx.send("No channels are configured for this server!")
+        return
+
+    guild_config = config['guilds'][guild_id_str]
+    voice_channels = guild_config.get('voice_channels', [])
+    text_channel_id = guild_config.get('text_channel_id')
+
+    response = ["**Monitored Channels in this Server:**\n"]
+    
+    if voice_channels:
+        response.append("**Voice Channels:**")
+        for channel_id in voice_channels:
+            channel = ctx.guild.get_channel(channel_id)
+            response.append(f"• {channel.mention if channel else 'Unknown Channel'}")
+    else:
+        response.append("No voice channels configured.")
+
+    if text_channel_id:
+        text_channel = ctx.guild.get_channel(text_channel_id)
+        response.append(f"\n**Warning Channel:**\n• {text_channel.mention if text_channel else 'Unknown Channel'}")
+    else:
+        response.append("\nNo warning channel configured.")
+
+    await ctx.send('\n'.join(response))
 
 @bot.command()
 @commands.has_permissions(administrator=True)
@@ -214,7 +248,8 @@ def save_config():
     with open('config.json', 'w') as f:
         json.dump(config, f, indent=4)
 
-@setvoicechannel.error
+@addvoicechannel.error
+@removevoicechannel.error
 @settextchannel.error
 async def channel_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
@@ -227,22 +262,22 @@ async def channel_error(ctx, error):
 # ------------------------- Help Command -------------------------
 @bot.command()
 async def dochelp(ctx):
-    """
-    Provides information on how the bot works and lists admin commands for setup.
-    """
+    """Provides information on how the bot works and lists admin commands for setup."""
     help_text = (
         "**__Bot Overview__**\n"
-        "• I automatically mute anyone who joins the configured voice channel with their camera off.\n"
+        "• I automatically mute anyone who joins a monitored voice channel with their camera off.\n"
         "• I send them a warning in the configured text channel.\n"
         "• If they don't turn on the camera within 2 minutes, I kick them from voice.\n\n"
         
-        "**__Admin Setup__**\n"
-        "1. **!setvoicechannel voice-channel**\n"
-        "   - Sets the voice channel to monitor.\n"
-        "2. **!settextchannel #text-channel**\n"
-        "   - Sets the text channel where warnings are posted.\n\n"
-
-
+        "**__Admin Commands__**\n"
+        "1. **!addvoicechannel voice-channel**\n"
+        "   - Add a voice channel to monitor.\n"
+        "2. **!removevoicechannel voice-channel**\n"
+        "   - Remove a voice channel from monitoring.\n"
+        "3. **!settextchannel #text-channel**\n"
+        "   - Set the text channel for warnings.\n"
+        "4. **!listchannels**\n"
+        "   - Show all monitored channels.\n"
     )
     await ctx.send(help_text)
 
